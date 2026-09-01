@@ -1,0 +1,29 @@
+[Unit]
+Description=What to Eat Telegram Bot
+Documentation=file:/opt/what-to-eat-bot/docs/DEPLOYMENT.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=whattoeat
+Group=whattoeat
+WorkingDirectory=/opt/what-to-eat-bot
+EnvironmentFile=/etc/what-to-eat-bot.env
+ExecStart=/opt/what-to-eat-bot/.venv/bin/python -m what_to_eat_bot
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+UMask=0077
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/what-to-eat-bot
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=what-to-eat-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "what-to-eat-bot"
+version = "0.1.0"
+description = "Personal and family Telegram meal chooser"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram==3.31.0",
+  "aiosqlite==0.22.1",
+  "pydantic-settings==2.15.0",
+]
+
+[project.scripts]
+what-to-eat-bot = "what_to_eat_bot.__main__:main"
+what-to-eat-migrate = "what_to_eat_bot.migrate:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+what_to_eat_bot = ["migrations/*.sql"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.ruff.format]
+quote-style = "double"
