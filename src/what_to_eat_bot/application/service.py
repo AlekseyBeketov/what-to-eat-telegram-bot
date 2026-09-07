@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import secrets
 from collections.abc import Callable, Iterable, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from random import Random
+from zoneinfo import ZoneInfo
 
 from what_to_eat_bot.application.normalization import (
     display_name,
@@ -12,7 +13,13 @@ from what_to_eat_bot.application.normalization import (
     parse_ingredient_list,
 )
 from what_to_eat_bot.domain.errors import ConflictError
-from what_to_eat_bot.domain.models import Dish, Ingredient, MealType, Recommendation
+from what_to_eat_bot.domain.models import (
+    Dish,
+    FamilyMealProposal,
+    Ingredient,
+    MealType,
+    Recommendation,
+)
 from what_to_eat_bot.repositories.app import AppRepository
 
 
@@ -23,11 +30,13 @@ class MealService:
         invite_ttl_hours: int = 72,
         clock: Callable[[], datetime] | None = None,
         random: Random | None = None,
+        proposal_timezone: str = "Europe/Moscow",
     ) -> None:
         self.repository = repository
         self.invite_ttl_hours = invite_ttl_hours
         self._clock = clock or (lambda: datetime.now(UTC))
         self._random = random or Random()
+        self._proposal_timezone = ZoneInfo(proposal_timezone)
 
     async def create_dish(
         self, user_id: int, name: str, meal_type: MealType, ingredient_ids: Sequence[int]
@@ -196,6 +205,47 @@ class MealService:
 
     async def accept_family_invite(self, user_id: int, token: str) -> int:
         return await self.repository.accept_invite(user_id, self.hash_invite(token), self._clock())
+
+    async def create_family_proposal(self, proposer_id: int, dish_id: int) -> FamilyMealProposal:
+        dish = await self.repository.get_dish(proposer_id, dish_id)
+        now = self._clock()
+        local_now = now.astimezone(self._proposal_timezone)
+        expires_at = datetime.combine(
+            local_now.date() + timedelta(days=1),
+            time.min,
+            tzinfo=self._proposal_timezone,
+        ).astimezone(UTC)
+        return await self.repository.create_family_proposal(proposer_id, dish, now, expires_at)
+
+    async def record_family_proposal_message(
+        self, proposal_id: int, user_id: int, message_id: int
+    ) -> None:
+        await self.repository.record_family_proposal_message(proposal_id, user_id, message_id)
+
+    async def record_family_proposal_sender_message(
+        self, proposal_id: int, proposer_id: int, message_id: int
+    ) -> None:
+        await self.repository.record_family_proposal_sender_message(
+            proposal_id, proposer_id, message_id
+        )
+
+    async def get_family_proposal(self, viewer_id: int, proposal_id: int) -> FamilyMealProposal:
+        return await self.repository.get_family_proposal(viewer_id, proposal_id)
+
+    async def expire_family_proposals(self) -> list[FamilyMealProposal]:
+        return await self.repository.expire_family_proposals(self._clock())
+
+    async def respond_to_family_proposal(
+        self, user_id: int, proposal_id: int, accepted: bool
+    ) -> tuple[FamilyMealProposal, bool]:
+        return await self.repository.respond_to_family_proposal(
+            user_id, proposal_id, accepted, self._clock()
+        )
+
+    async def cancel_family_proposal(
+        self, proposer_id: int, proposal_id: int
+    ) -> FamilyMealProposal:
+        return await self.repository.cancel_family_proposal(proposer_id, proposal_id, self._clock())
 
     @staticmethod
     def hash_invite(token: str) -> str:

@@ -18,9 +18,17 @@ async def test_migrate_clean_database_is_idempotent(tmp_path: Path) -> None:
             await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
         ).fetchall()
     names = {row[0] for row in tables}
-    assert version[0] == 2
+    assert version[0] == 3
     assert foreign_keys[0] == 1
-    assert {"users", "dishes", "ingredients", "family_invites", "dish_tags"} <= names
+    assert {
+        "users",
+        "dishes",
+        "ingredients",
+        "family_invites",
+        "dish_tags",
+        "family_meal_proposals",
+        "family_meal_proposal_recipients",
+    } <= names
 
 
 async def test_seed_catalog_is_loaded_once_and_search_is_case_and_yo_insensitive(
@@ -51,7 +59,7 @@ async def test_seed_catalog_is_loaded_once_and_search_is_case_and_yo_insensitive
 
     assert dish_count[0] == 22
     assert links_count[0] == 79
-    assert versions[0] == 2
+    assert versions[0] == 3
 
     repository = AppRepository(database)
     upper_case = await repository.list_dishes(

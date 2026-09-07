@@ -290,7 +290,8 @@ async def test_polling_shutdown_closes_session_without_closed_attribute(monkeypa
         resolve_used_update_types=lambda: [],
         storage=SimpleNamespace(close=AsyncMock()),
     )
-    application = SimpleNamespace(bot=bot, dispatcher=dispatcher)
+    service = SimpleNamespace(expire_family_proposals=AsyncMock(return_value=[]))
+    application = SimpleNamespace(bot=bot, dispatcher=dispatcher, service=service)
     monkeypatch.setattr(app_module, "create_application", AsyncMock(return_value=application))
 
     await app_module.run_polling(SimpleNamespace())

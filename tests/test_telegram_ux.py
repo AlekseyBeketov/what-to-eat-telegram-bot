@@ -1,8 +1,18 @@
+from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from what_to_eat_bot.domain.models import Dish, Ingredient, MealType, Recommendation
-from what_to_eat_bot.handlers import add_dish, catalog, recommend
+from what_to_eat_bot.domain.models import (
+    Dish,
+    FamilyMealProposal,
+    FamilyProposalRecipient,
+    Ingredient,
+    MealType,
+    ProposalStatus,
+    Recommendation,
+)
+from what_to_eat_bot.handlers import add_dish, catalog, family_proposals, recommend
 from what_to_eat_bot.handlers.keyboards import (
     MAIN_MENU,
     category_picker,
@@ -61,6 +71,22 @@ def test_main_menu_uses_books_emoji_for_catalog() -> None:
 def test_dish_card_does_not_offer_use_for_selection() -> None:
     callbacks = _callbacks(dish_card(_dish(1), viewer_id=1))
     assert not any(value.startswith("dish:use:") for value in callbacks)
+
+
+def test_author_dish_card_uses_approved_family_proposal_layout() -> None:
+    assert _rows(dish_card(_dish(1), viewer_id=1)) == [
+        ["✏️ Редактировать", "⭐ В избранное"],
+        ["😋 Предложить семье", "🗑 Удалить"],
+        ["✅ Приготовил", "⬅️ К каталогу"],
+    ]
+
+
+def test_family_member_can_propose_another_members_dish() -> None:
+    dish = Dish(1, 2, "Другой", "Блюдо", "блюдо", MealType.MAIN)
+    assert _rows(dish_card(dish, viewer_id=1)) == [
+        ["⭐ В избранное", "😋 Предложить семье"],
+        ["✅ Приготовил", "⬅️ К каталогу"],
+    ]
 
 
 def test_add_category_picker_has_no_frequent_or_recent_shortcuts() -> None:
@@ -264,3 +290,167 @@ async def test_add_confirmation_uses_requested_three_row_footer() -> None:
         ["✅ Сохранить", "❌ Отмена"],
     ]
     assert "☕️ Завтрак" in callback.message.answer.await_args.args[0]
+
+
+def _proposal(*, status: ProposalStatus = ProposalStatus.OPEN) -> FamilyMealProposal:
+    accepted = True if status is ProposalStatus.AGREED else None
+    return FamilyMealProposal(
+        id=7,
+        family_id=10,
+        dish_id=42,
+        proposer_id=1,
+        proposer_name="Алексей",
+        dish_name="Жареные пельмени",
+        meal_type=MealType.MAIN,
+        ingredient_names=("Пельмени",),
+        status=status,
+        expires_at=datetime(2026, 1, 2, tzinfo=UTC),
+        recipients=(
+            FamilyProposalRecipient(2, "Мария", accepted, 101 if accepted is not None else None),
+            FamilyProposalRecipient(3, "Иван", accepted, 102 if accepted is not None else None),
+        ),
+    )
+
+
+async def test_family_proposal_confirmation_uses_approved_copy_and_buttons() -> None:
+    callback = _callback("dish:propose:42")
+    repository = SimpleNamespace(
+        get_dish=AsyncMock(return_value=_dish(42, "Жареные пельмени")),
+        family_info=AsyncMock(return_value=(10, "Дом", [(1, "Алексей"), (2, "Мария")])),
+    )
+
+    await family_proposals.propose_prompt(callback, repository)
+
+    prompt = callback.message.answer.await_args.args[0]
+    markup = callback.message.answer.await_args.kwargs["reply_markup"]
+    assert "Жареные пельмени" in prompt
+    assert _rows(markup) == [["✅ Да, отправить", "❌ Отмена"]]
+
+
+async def test_family_proposal_is_sent_to_every_other_member() -> None:
+    callback = _callback("proposal:send:42")
+    callback.message.message_id = 500
+    proposal = _proposal()
+    service = SimpleNamespace(
+        create_family_proposal=AsyncMock(return_value=proposal),
+        record_family_proposal_message=AsyncMock(),
+        record_family_proposal_sender_message=AsyncMock(),
+        get_family_proposal=AsyncMock(return_value=proposal),
+    )
+    bot = SimpleNamespace(
+        send_message=AsyncMock(
+            side_effect=[SimpleNamespace(message_id=101), SimpleNamespace(message_id=102)]
+        )
+    )
+
+    await family_proposals.send_proposal(callback, bot, service)
+
+    assert [call.args[0] for call in bot.send_message.await_args_list] == [2, 3]
+    recipient_text = bot.send_message.await_args_list[0].args[1]
+    recipient_markup = bot.send_message.await_args_list[0].kwargs["reply_markup"]
+    assert "Согласны приготовить это блюдо?" in recipient_text
+    assert _rows(recipient_markup) == [["✅ Согласен(на)", "❌ Не согласен(на)"]]
+    assert service.record_family_proposal_message.await_count == 2
+    service.record_family_proposal_sender_message.assert_awaited_once_with(7, 1, 500)
+    sender_text = callback.message.edit_text.await_args.args[0]
+    assert "Ответили: 0 из 2" in sender_text
+
+
+async def test_repeated_send_resumes_only_undelivered_recipients() -> None:
+    callback = _callback("proposal:send:42")
+    proposal = replace(
+        _proposal(),
+        recipients=(
+            FamilyProposalRecipient(2, "Мария", message_id=101),
+            FamilyProposalRecipient(3, "Иван"),
+        ),
+    )
+    service = SimpleNamespace(
+        create_family_proposal=AsyncMock(return_value=proposal),
+        record_family_proposal_message=AsyncMock(),
+        get_family_proposal=AsyncMock(return_value=proposal),
+    )
+    bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=102)))
+
+    await family_proposals.send_proposal(callback, bot, service)
+
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.args[0] == 3
+    service.record_family_proposal_message.assert_awaited_once_with(7, 3, 102)
+
+
+async def test_send_race_renders_completed_state_after_fast_last_vote() -> None:
+    callback = _callback("proposal:send:42")
+    open_proposal = _proposal()
+    agreed_proposal = _proposal(status=ProposalStatus.AGREED)
+    service = SimpleNamespace(
+        create_family_proposal=AsyncMock(return_value=open_proposal),
+        record_family_proposal_message=AsyncMock(),
+        get_family_proposal=AsyncMock(return_value=agreed_proposal),
+    )
+    bot = SimpleNamespace(
+        send_message=AsyncMock(
+            side_effect=[SimpleNamespace(message_id=101), SimpleNamespace(message_id=102)]
+        ),
+        edit_message_reply_markup=AsyncMock(),
+    )
+
+    await family_proposals.send_proposal(callback, bot, service)
+
+    assert "Договорились" in callback.message.edit_text.await_args.args[0]
+    assert callback.message.edit_text.await_args.kwargs["reply_markup"] is None
+    assert bot.edit_message_reply_markup.await_count == 2
+
+
+async def test_last_positive_vote_notifies_everyone_and_closes_buttons() -> None:
+    callback = _callback("proposal:vote:7:yes", user_id=3)
+    proposal = replace(_proposal(status=ProposalStatus.AGREED), proposer_message_id=200)
+    service = SimpleNamespace(respond_to_family_proposal=AsyncMock(return_value=(proposal, True)))
+    bot = SimpleNamespace(
+        send_message=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        edit_message_reply_markup=AsyncMock(),
+    )
+
+    await family_proposals.vote_proposal(callback, bot, service)
+
+    assert callback.message.edit_text.await_args.kwargs["reply_markup"] is None
+    assert "Ваш ответ: <b>✅ Согласен(на)</b>" in callback.message.edit_text.await_args.args[0]
+    assert bot.edit_message_reply_markup.await_count == 2
+    final_calls = [
+        call for call in bot.send_message.await_args_list if "Договорились" in call.args[1]
+    ]
+    assert [call.args[0] for call in final_calls] == [2, 3]
+    assert bot.edit_message_text.await_args.kwargs["message_id"] == 200
+    assert (
+        "<b>Согласны:</b>\n• Алексей\n• Мария\n• Иван"
+        in bot.edit_message_text.await_args.kwargs["text"]
+    )
+
+
+async def test_expiration_closes_all_buttons_and_notifies_family() -> None:
+    proposal = replace(
+        _proposal(status=ProposalStatus.EXPIRED),
+        proposer_message_id=200,
+        recipients=(
+            FamilyProposalRecipient(2, "Мария", message_id=101),
+            FamilyProposalRecipient(3, "Иван", message_id=102),
+        ),
+    )
+    service = SimpleNamespace(expire_family_proposals=AsyncMock(return_value=[proposal]))
+    bot = SimpleNamespace(
+        send_message=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        edit_message_reply_markup=AsyncMock(),
+    )
+
+    processed = await family_proposals.process_expired_proposals(
+        bot,
+        service,  # type: ignore[arg-type]
+    )
+
+    assert processed == 1
+    assert bot.edit_message_reply_markup.await_count == 2
+    assert bot.edit_message_text.await_args.kwargs["message_id"] == 200
+    assert [call.args[0] for call in bot.send_message.await_args_list] == [1, 2, 3]
+    assert all("больше неактуально" in call.args[1] for call in bot.send_message.await_args_list)

@@ -57,7 +57,7 @@
 
 ## Нефункциональные требования
 
-No secrets in tracked files/logs, один polling process, временные SQLite databases в tests, pagination, user-friendly expected errors, systemd under unprivileged user, backup-before-update instructions.
+No secrets in tracked files/logs, один polling process, временные SQLite databases в tests, pagination, user-friendly expected errors, systemd service с явными filesystem protections и отдельным writable data directory; на текущем сервере используется запуск от root для совместимости с соседними services, backup-before-update instructions.
 
 ## Отложено
 

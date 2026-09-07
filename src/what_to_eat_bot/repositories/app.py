@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -13,7 +14,15 @@ from what_to_eat_bot.domain.errors import (
     InvalidInviteError,
     NotFoundError,
 )
-from what_to_eat_bot.domain.models import Dish, FamilyInvite, Ingredient, MealType
+from what_to_eat_bot.domain.models import (
+    Dish,
+    FamilyInvite,
+    FamilyMealProposal,
+    FamilyProposalRecipient,
+    Ingredient,
+    MealType,
+    ProposalStatus,
+)
 
 _VISIBLE = """
 (
@@ -459,6 +468,298 @@ class AppRepository:
             ).fetchall()
             return int(family[0]), str(family[1]), [(int(r[0]), str(r[1])) for r in members]
 
+    async def create_family_proposal(
+        self,
+        proposer_id: int,
+        dish: Dish,
+        now: datetime,
+        expires_at: datetime,
+    ) -> FamilyMealProposal:
+        now_value = now.astimezone(UTC).isoformat()
+        expires_value = expires_at.astimezone(UTC).isoformat()
+        async with self.database.connect() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                family = await (
+                    await db.execute(
+                        "SELECT family_id FROM family_members WHERE user_id=?", (proposer_id,)
+                    )
+                ).fetchone()
+                if not family:
+                    raise ConflictError("Сначала создайте семью или вступите в неё")
+                family_id = int(family[0])
+                visible = await (
+                    await db.execute(
+                        """
+                        SELECT 1 FROM dishes d
+                        WHERE d.id=? AND (
+                            d.author_id=? OR EXISTS (
+                                SELECT 1 FROM family_members fm
+                                WHERE fm.family_id=? AND fm.user_id=d.author_id
+                            )
+                        )
+                        """,
+                        (dish.id, proposer_id, family_id),
+                    )
+                ).fetchone()
+                if not visible:
+                    raise AccessDeniedError("Блюдо больше не доступно вашей семье")
+                recipients = await (
+                    await db.execute(
+                        """
+                        SELECT user_id FROM family_members
+                        WHERE family_id=? AND user_id<>? ORDER BY joined_at
+                        """,
+                        (family_id, proposer_id),
+                    )
+                ).fetchall()
+                if not recipients:
+                    raise ConflictError("В семье пока нет других участников")
+                await db.execute(
+                    """
+                    UPDATE family_meal_proposals
+                    SET status='expired', closed_at=?
+                    WHERE proposer_id=? AND dish_id=? AND status='open' AND expires_at<=?
+                    """,
+                    (now_value, proposer_id, dish.id, now_value),
+                )
+                existing = await (
+                    await db.execute(
+                        """
+                        SELECT id FROM family_meal_proposals
+                        WHERE proposer_id=? AND dish_id=? AND status='open'
+                        """,
+                        (proposer_id, dish.id),
+                    )
+                ).fetchone()
+                if existing:
+                    proposal = await self._family_proposal(db, int(existing[0]))
+                    await db.commit()
+                    return proposal
+                cursor = await db.execute(
+                    """
+                    INSERT INTO family_meal_proposals(
+                        family_id, dish_id, proposer_id, dish_name, meal_type,
+                        ingredients_json, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        family_id,
+                        dish.id,
+                        proposer_id,
+                        dish.name,
+                        dish.meal_type.value,
+                        json.dumps(
+                            [ingredient.name for ingredient in dish.ingredients],
+                            ensure_ascii=False,
+                        ),
+                        expires_value,
+                    ),
+                )
+                if cursor.lastrowid is None:
+                    raise RuntimeError("Не удалось создать предложение")
+                proposal_id = int(cursor.lastrowid)
+                await db.executemany(
+                    """
+                    INSERT INTO family_meal_proposal_recipients(proposal_id, user_id)
+                    VALUES (?, ?)
+                    """,
+                    [(proposal_id, int(row[0])) for row in recipients],
+                )
+                proposal = await self._family_proposal(db, proposal_id)
+                await db.commit()
+                return proposal
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def record_family_proposal_message(
+        self, proposal_id: int, user_id: int, message_id: int
+    ) -> None:
+        async with self.database.connect() as db:
+            cursor = await db.execute(
+                """
+                UPDATE family_meal_proposal_recipients SET message_id=?
+                WHERE proposal_id=? AND user_id=?
+                """,
+                (message_id, proposal_id, user_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("Получатель предложения не найден")
+            await db.commit()
+
+    async def record_family_proposal_sender_message(
+        self, proposal_id: int, proposer_id: int, message_id: int
+    ) -> None:
+        async with self.database.connect() as db:
+            cursor = await db.execute(
+                """
+                UPDATE family_meal_proposals SET proposer_message_id=?
+                WHERE id=? AND proposer_id=?
+                """,
+                (message_id, proposal_id, proposer_id),
+            )
+            if cursor.rowcount != 1:
+                raise AccessDeniedError("Предложение не найдено")
+            await db.commit()
+
+    async def get_family_proposal(self, viewer_id: int, proposal_id: int) -> FamilyMealProposal:
+        async with self.database.connect() as db:
+            proposal = await self._family_proposal(db, proposal_id)
+        if proposal.proposer_id == viewer_id or any(
+            recipient.user_id == viewer_id for recipient in proposal.recipients
+        ):
+            return proposal
+        raise AccessDeniedError("Предложение адресовано другой семье")
+
+    async def expire_family_proposals(self, now: datetime) -> list[FamilyMealProposal]:
+        now_value = now.astimezone(UTC).isoformat()
+        async with self.database.connect() as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                rows = await (
+                    await db.execute(
+                        """
+                        SELECT id FROM family_meal_proposals
+                        WHERE status='open' AND expires_at<=? ORDER BY id
+                        """,
+                        (now_value,),
+                    )
+                ).fetchall()
+                proposal_ids = [int(row[0]) for row in rows]
+                if proposal_ids:
+                    placeholders = ",".join("?" for _ in proposal_ids)
+                    await db.execute(
+                        f"""
+                        UPDATE family_meal_proposals SET status='expired', closed_at=?
+                        WHERE id IN ({placeholders}) AND status='open'
+                        """,
+                        [now_value, *proposal_ids],
+                    )
+                proposals = [
+                    await self._family_proposal(db, proposal_id) for proposal_id in proposal_ids
+                ]
+                await db.commit()
+                return proposals
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def respond_to_family_proposal(
+        self,
+        user_id: int,
+        proposal_id: int,
+        accepted: bool,
+        now: datetime,
+    ) -> tuple[FamilyMealProposal, bool]:
+        now_value = now.astimezone(UTC).isoformat()
+        async with self.database.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute(
+                    """
+                    SELECT p.status, p.expires_at, p.family_id, r.accepted
+                    FROM family_meal_proposals p
+                    JOIN family_meal_proposal_recipients r ON r.proposal_id=p.id
+                    WHERE p.id=? AND r.user_id=?
+                    """,
+                    (proposal_id, user_id),
+                )
+            ).fetchone()
+            if not row:
+                await db.rollback()
+                raise AccessDeniedError("Это предложение адресовано другому участнику")
+            member = await (
+                await db.execute(
+                    "SELECT 1 FROM family_members WHERE family_id=? AND user_id=?",
+                    (row[2], user_id),
+                )
+            ).fetchone()
+            if not member:
+                await db.rollback()
+                raise AccessDeniedError("Вы больше не состоите в этой семье")
+            status = ProposalStatus(str(row[0]))
+            if status is ProposalStatus.OPEN and self._datetime(str(row[1])) <= now:
+                await db.execute(
+                    "UPDATE family_meal_proposals SET status='expired', closed_at=? WHERE id=?",
+                    (now_value, proposal_id),
+                )
+                await db.commit()
+                raise ConflictError("Предложение уже неактуально")
+            if status is not ProposalStatus.OPEN:
+                await db.rollback()
+                raise ConflictError("Предложение уже завершено")
+            previous = None if row[3] is None else bool(row[3])
+            if previous == accepted:
+                proposal = await self._family_proposal(db, proposal_id)
+                await db.commit()
+                return proposal, False
+            await db.execute(
+                """
+                UPDATE family_meal_proposal_recipients
+                SET accepted=?, responded_at=? WHERE proposal_id=? AND user_id=?
+                """,
+                (int(accepted), now_value, proposal_id, user_id),
+            )
+            counts = await (
+                await db.execute(
+                    """
+                    SELECT COUNT(*),
+                           SUM(CASE WHEN accepted IS NULL THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN accepted=0 THEN 1 ELSE 0 END)
+                    FROM family_meal_proposal_recipients WHERE proposal_id=?
+                    """,
+                    (proposal_id,),
+                )
+            ).fetchone()
+            if counts is None:
+                await db.rollback()
+                raise NotFoundError("Предложение не найдено")
+            if int(counts[0]) > 0 and int(counts[1] or 0) == 0 and int(counts[2] or 0) == 0:
+                await db.execute(
+                    """
+                    UPDATE family_meal_proposals SET status='agreed', closed_at=? WHERE id=?
+                    """,
+                    (now_value, proposal_id),
+                )
+            proposal = await self._family_proposal(db, proposal_id)
+            await db.commit()
+            return proposal, True
+
+    async def cancel_family_proposal(
+        self, proposer_id: int, proposal_id: int, now: datetime
+    ) -> FamilyMealProposal:
+        now_value = now.astimezone(UTC).isoformat()
+        async with self.database.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute(
+                    "SELECT proposer_id, status, expires_at FROM family_meal_proposals WHERE id=?",
+                    (proposal_id,),
+                )
+            ).fetchone()
+            if not row or int(row[0]) != proposer_id:
+                await db.rollback()
+                raise AccessDeniedError("Отменить предложение может только его автор")
+            status = ProposalStatus(str(row[1]))
+            if status is ProposalStatus.OPEN and self._datetime(str(row[2])) <= now:
+                await db.execute(
+                    "UPDATE family_meal_proposals SET status='expired', closed_at=? WHERE id=?",
+                    (now_value, proposal_id),
+                )
+                await db.commit()
+                raise ConflictError("Предложение уже неактуально")
+            if status is not ProposalStatus.OPEN:
+                await db.rollback()
+                raise ConflictError("Предложение уже завершено")
+            await db.execute(
+                "UPDATE family_meal_proposals SET status='cancelled', closed_at=? WHERE id=?",
+                (now_value, proposal_id),
+            )
+            proposal = await self._family_proposal(db, proposal_id)
+            await db.commit()
+            return proposal
+
     async def create_invite(self, user_id: int, token_hash: str, expires_at: datetime) -> int:
         info = await self.family_info(user_id)
         if not info:
@@ -548,6 +849,60 @@ class AppRepository:
                 await db.execute("DELETE FROM families WHERE id=?", (family_id,))
             await db.commit()
             return True
+
+    async def _family_proposal(
+        self, db: aiosqlite.Connection, proposal_id: int
+    ) -> FamilyMealProposal:
+        row = await (
+            await db.execute(
+                """
+                SELECT p.id, p.family_id, p.dish_id, p.proposer_id, u.display_name,
+                       p.dish_name, p.meal_type, p.ingredients_json, p.status, p.expires_at,
+                       p.proposer_message_id
+                FROM family_meal_proposals p
+                JOIN users u ON u.telegram_id=p.proposer_id
+                WHERE p.id=?
+                """,
+                (proposal_id,),
+            )
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("Предложение не найдено")
+        recipient_rows = await (
+            await db.execute(
+                """
+                SELECT r.user_id, u.display_name, r.accepted, r.message_id
+                FROM family_meal_proposal_recipients r
+                JOIN users u ON u.telegram_id=r.user_id
+                WHERE r.proposal_id=? ORDER BY r.user_id
+                """,
+                (proposal_id,),
+            )
+        ).fetchall()
+        recipients = tuple(
+            FamilyProposalRecipient(
+                user_id=int(recipient[0]),
+                name=str(recipient[1]),
+                accepted=None if recipient[2] is None else bool(recipient[2]),
+                message_id=None if recipient[3] is None else int(recipient[3]),
+            )
+            for recipient in recipient_rows
+        )
+        ingredient_names = tuple(str(value) for value in json.loads(str(row[7])))
+        return FamilyMealProposal(
+            id=int(row[0]),
+            family_id=int(row[1]),
+            dish_id=None if row[2] is None else int(row[2]),
+            proposer_id=int(row[3]),
+            proposer_name=str(row[4]),
+            dish_name=str(row[5]),
+            meal_type=MealType(str(row[6])),
+            ingredient_names=ingredient_names,
+            status=ProposalStatus(str(row[8])),
+            expires_at=self._datetime(str(row[9])),
+            proposer_message_id=None if row[10] is None else int(row[10]),
+            recipients=recipients,
+        )
 
     async def _fetch_dishes(
         self,

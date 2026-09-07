@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from contextlib import suppress
 from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher, Router
@@ -10,7 +12,15 @@ from aiogram.types import ErrorEvent
 from what_to_eat_bot.application.service import MealService
 from what_to_eat_bot.config import Settings
 from what_to_eat_bot.database import Database
-from what_to_eat_bot.handlers import add_dish, catalog, edit_dish, recommend, settings_family, start
+from what_to_eat_bot.handlers import (
+    add_dish,
+    catalog,
+    edit_dish,
+    family_proposals,
+    recommend,
+    settings_family,
+    start,
+)
 from what_to_eat_bot.repositories.app import AppRepository
 
 logger = logging.getLogger(__name__)
@@ -46,6 +56,7 @@ async def create_application(settings: Settings) -> Application:
         add_dish.router,
         edit_dish.router,
         catalog.router,
+        family_proposals.router,
         recommend.router,
         settings_family.router,
         _fallback_router(),
@@ -87,6 +98,9 @@ def _fallback_router() -> Router:
 
 async def run_polling(settings: Settings) -> None:
     application = await create_application(settings)
+    expiration_task = asyncio.create_task(
+        family_proposals.expiration_worker(application.bot, application.service)
+    )
     logger.info("Starting long polling")
     try:
         await application.bot.delete_webhook(drop_pending_updates=False)
@@ -97,6 +111,9 @@ async def run_polling(settings: Settings) -> None:
             close_bot_session=False,
         )
     finally:
+        expiration_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await expiration_task
         await application.dispatcher.storage.close()
         await application.bot.session.close()
         logger.info("Long polling stopped")

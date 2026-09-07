@@ -77,14 +77,22 @@ def dish_list(dishes: Sequence[Dish], page: int, prefix: str = "dish") -> Inline
 
 def dish_card(dish: Dish, viewer_id: int) -> InlineKeyboardMarkup:
     favorite = "☆ Убрать из избранного" if dish.is_favorite else "⭐ В избранное"
-    rows: list[list[tuple[str, str]]] = [
-        [(favorite, f"dish:fav:{dish.id}"), ("✅ Приготовил", f"dish:cooked:{dish.id}")],
-    ]
     if dish.author_id == viewer_id:
-        rows.append(
-            [("✏️ Редактировать", f"dish:edit:{dish.id}"), ("🗑 Удалить", f"dish:delete:{dish.id}")]
-        )
-    rows.append([("⬅️ К каталогу", "catalog:root")])
+        rows = [
+            [("✏️ Редактировать", f"dish:edit:{dish.id}"), (favorite, f"dish:fav:{dish.id}")],
+            [
+                ("😋 Предложить семье", f"dish:propose:{dish.id}"),
+                ("🗑 Удалить", f"dish:delete:{dish.id}"),
+            ],
+        ]
+    else:
+        rows = [
+            [
+                (favorite, f"dish:fav:{dish.id}"),
+                ("😋 Предложить семье", f"dish:propose:{dish.id}"),
+            ]
+        ]
+    rows.append([("✅ Приготовил", f"dish:cooked:{dish.id}"), ("⬅️ К каталогу", "catalog:root")])
     return buttons(rows)
 
 
